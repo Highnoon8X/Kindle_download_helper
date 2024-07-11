@@ -8,33 +8,35 @@ import html
 import json
 import logging
 import os
+import pathlib
 import pickle
 import re
+import shutil
 import time
 import urllib
-import pathlib
 from http.cookies import SimpleCookie
 
 import requests
 import urllib3
+from moki import extract
 from requests.adapters import HTTPAdapter
 
-from kindle_download_helper.dedrm import MobiBook, get_pid_list
 from kindle_download_helper.config import (
-    KINDLE_URLS,
-    DEFAULT_OUT_DIR,
-    DEFAULT_SESSION_FILE,
-    DEFAULT_OUT_DEDRM_DIR,
     CONTENT_TYPES,
-    KINDLE_STAT_TEMPLATE,
-)
-from kindle_download_helper.config import (
-    MY_KINDLE_STATS_INFO_HEAD,
+    DEFAULT_OUT_DEDRM_DIR,
+    DEFAULT_OUT_DIR,
+    DEFAULT_OUT_EPUB_DIR,
+    DEFAULT_SESSION_FILE,
+    ERROR_LOG_FILE,
     KINDLE_HEADER,
-    MY_KINDLE_STATS_INFO,
+    KINDLE_STAT_TEMPLATE,
     KINDLE_TABLE_HEAD,
+    KINDLE_URLS,
+    MY_KINDLE_STATS_INFO,
+    MY_KINDLE_STATS_INFO_HEAD,
 )
-from kindle_download_helper.utils import replace_readme_comments
+from kindle_download_helper.dedrm import MobiBook, get_pid_list
+from kindle_download_helper.utils import replace_readme_comments, trim_title_suffix
 
 try:
     import browser_cookie3
@@ -42,27 +44,11 @@ except ModuleNotFoundError:
     print("not found browser_cookie3 here, you should use --cookie command")
 
 logger = logging.getLogger("kindle")
-fh = logging.FileHandler(".error_books.log")
+fh = logging.FileHandler(ERROR_LOG_FILE)
 fh.setLevel(logging.ERROR)
 logger.addHandler(fh)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-
-def find_device(devices, device_sn):
-    if isinstance(device_sn, str) and device_sn != "":
-        for device in devices:
-            if device["deviceSerialNumber"] == device_sn.strip():
-                logger.info(
-                    f"Using specified device with serial number: {device['deviceSerialNumber']}"
-                )
-                return device
-        else:
-            logger.info(f"Can't find device with serial number: {device_sn}")
-    logger.info(
-        f"Using default device serial Number: {devices[0]['deviceSerialNumber']}"
-    )
-    return devices[0]
 
 
 class Kindle:
@@ -72,7 +58,8 @@ class Kindle:
         domain="cn",
         out_dir=DEFAULT_OUT_DIR,
         out_dedrm_dir=DEFAULT_OUT_DEDRM_DIR,
-        cut_length=100,
+        out_epub_dir=DEFAULT_OUT_EPUB_DIR,
+        cut_length=76,
         session_file=DEFAULT_SESSION_FILE,
         **kwargs,
     ):
@@ -81,6 +68,7 @@ class Kindle:
         self.total_to_download = 0
         self.out_dir = out_dir
         self.out_dedrm_dir = out_dedrm_dir
+        self.out_epub_dir = out_epub_dir
         self.dedrm = False
         self.cut_length = cut_length
         self.not_done = False
@@ -121,7 +109,7 @@ class Kindle:
         if not self.session.cookies:
             logger.debug("No cookie found, trying to load from browsers")
             try:
-                self.set_cookie(browser_cookie3.load(domain_name="amazon"))
+                self.set_cookie(browser_cookie3.load())
             except:
                 print("not found browser_cookie3 here, you should use --cookie command")
 
@@ -137,6 +125,25 @@ class Kindle:
                 cookies_dict, cookiejar=None, overwrite=True
             )
         return cookiejar
+
+    def find_device(self):
+        devices = self.get_devices()
+        device_sn = self.device_sn
+
+        if isinstance(device_sn, str) and device_sn != "":
+            for device in devices:
+                if device["deviceSerialNumber"] == device_sn.strip():
+                    logger.info(
+                        f"Using specified device with serial number: {device['deviceSerialNumber']}"
+                    )
+                    return device
+            else:
+                logger.info(f"Can't find device with serial number: {device_sn}")
+        logger.info(
+            f"Using default device serial Number: {devices[0]['deviceSerialNumber']}"
+        )
+        self.device_serial_number = devices[0]["deviceSerialNumber"]
+        return devices[0]
 
     def _get_csrf_token(self):
         """
@@ -301,7 +308,7 @@ class Kindle:
                         logger.info(
                             f"Amazon bot check detected, sleep {sleep_seconds} sec last time and try this api again, now index: {startIndex}/{self.total_to_download}"
                         )
-                        logger.info(f"Next time fail will break the loop")
+                        logger.info("Next time fail will break the loop")
                         r = self.session.post(
                             self.urls["payload"],
                             data={
@@ -327,7 +334,11 @@ class Kindle:
             if not result.get("success", True):
                 logger.error("get all books error: %s", result.get("error"))
                 break
-            items = result["OwnershipData"]["items"]
+            try:
+                items = result["OwnershipData"]["items"]
+            except KeyError:
+                logger.error("get all books error: %s", result.get("error"))
+                break
             for item in items:
                 if filetype == "PDOC":
                     item["title"] = html.unescape(item["title"])
@@ -362,13 +373,15 @@ class Kindle:
         book_title = book.get("title", "")
 
         # filter the brackets in the book title
-        book_title = re.sub(r"(\（[^)]*\）|\([^)]*\)|\【[^)]*\】|\[[^)]*\])", "", book_title)
+        book_title = re.sub(
+            r"(\（[^)]*\）|\([^)]*\)|\【[^)]*\】|\[[^)]*\])", "", book_title
+        )
 
         book_title = book_title.replace(" ", "")
         if book.get("category", "") == "KindleEBook":
             book_url = book_url.format(book_id=asin)
             book_title = f"[{book_title}]({book_url})"
-        book_authors = book.get("authors")
+        book_authors = book.get("authors", "")
         if len(book_authors) > 10:
             book_authors = ",".join(book_authors.split(",")[:2]) + "..."
         # only keep date
@@ -399,9 +412,9 @@ class Kindle:
                 books_len=len(ebooks) if ebooks else 0,
                 pdocs_len=len(pdocs) if pdocs else 0,
                 first_book_title=first_ebook["title"] if first_ebook else "",
-                first_book_bought_date=first_ebook["acquiredDate"]
-                if first_ebook
-                else "",
+                first_book_bought_date=(
+                    first_ebook["acquiredDate"] if first_ebook else ""
+                ),
                 first_doc_title=first_pdoc["title"] if first_pdoc else "",
                 first_doc_push_date=first_pdoc["acquiredDate"] if first_pdoc else "",
             )
@@ -464,27 +477,28 @@ class Kindle:
 
             out = os.path.join(self.out_dir, name)
             out_dedrm = os.path.join(self.out_dedrm_dir, name)
+            out_epub = os.path.join(self.out_epub_dir, name.split(".")[0] + ".epub")
 
-            #normally one owns no more than 9999 books
+            # normally one owns no more than 9999 books
             count_digit_length = 4
 
             size_length = 6
-            size_in_mb = round(float(total_size) / (1024*1024), 3)
-            
+            size_in_mb = round(float(total_size) / (1024 * 1024), 3)
+
             logger.info(
                 f"[{index+1:>{count_digit_length}}/{self.total_to_download:>{count_digit_length}}][{size_in_mb:> {size_length}}Mb]Downloading {name}"
             )
 
-            #try if we can writ the file
-            try :
+            # try if we can write the file
+            try:
                 pathlib.Path(out).touch()
             except OSError as e:
-                if e.errno == 36 : #means file name too long
-                    name = self.trim_title_suffix(title) + extname
+                if e.errno == 36:  # means file name too long
+                    name = trim_title_suffix(title) + extname
                     logger.info(f"Original filename too long, trim to {name}")
                     out = os.path.join(self.out_dir, name)
                     out_dedrm = os.path.join(self.out_dedrm_dir, name)
-                else :
+                else:
                     logger.error(e)
 
             with open(out, "wb") as f:
@@ -499,17 +513,27 @@ class Kindle:
                     totalpids = get_pid_list(md1, md2, [self.device_serial_number], [])
                     totalpids = list(set(totalpids))
                     mb.make_drm_file(totalpids, out_dedrm)
+                    time.sleep(1)
+                    # save to EPUB
+                    epub_dir, epub_file = extract(out_dedrm)
+                    print(epub_file)
+                    shutil.copy2(epub_file, out_epub)
+                    # delete it
+                    shutil.rmtree(epub_dir)
+
                 except Exception as e:
                     logger.error("DeDRM failed for %s: %s", name, e)
                     pass
         except Exception as e:
             logger.error(str(e))
-            logger.error(f"Title: {title}, Asin: {asin} download failed")
+            logger.error(
+                f"Index: {index + 1}, Title: {title}, Asin: {asin} download failed"
+            )
 
     def download_books(self, start_index=0, filetype="EBOK"):
         # use default device
-        device = find_device(self.get_devices(), self.device_sn)
-        self.device_serial_number = device["deviceSerialNumber"]
+        device = self.find_device()
+
         books = self.get_all_books(filetype=filetype, start_index=start_index)
         if start_index > 0:
             print(f"resuming the download {start_index + 1}/{self.total_to_download}")
@@ -536,7 +560,8 @@ class Kindle:
 
         with open(os.path.join(self.out_dir, "key.txt"), "w") as f:
             f.write(f"Key is: {device['deviceSerialNumber']}")
-            logger.info("the device serial number can also be found here: {0}".format(os.path.join(self.out_dir, "key.txt")))
-
-    def trim_title_suffix(self, title):
-        return re.sub(r"(（[^）]+）?|【[^】]+】?)", "", title)
+            logger.info(
+                "the device serial number can also be found here: {0}".format(
+                    os.path.join(self.out_dir, "key.txt")
+                )
+            )
